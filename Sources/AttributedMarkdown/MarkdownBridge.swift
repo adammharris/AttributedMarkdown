@@ -455,8 +455,191 @@ private enum InlineSerializer {
 
     // BlockCollector: turns flat segments into structural blocks
     private struct BlockCollector {
+        static func buildBlocks(from segments: [Segment]) -> [Block] {
+            var blocks: [Block] = []
+            var i = 0
+            var lastWasBlank = false
 
-        // Rendering first so buildBlocks can reference BlockRenderer (e.g. for normalization).
+            // Helpers for accumulating
+            func flushParagraph(_ para: inout [Segment]) {
+                guard !para.isEmpty else { return }
+                // Merge adjacent plain whitespace-only segment separators inside paragraph
+                blocks.append(.paragraph(para))
+                para.removeAll()
+            }
+
+            while i < segments.count {
+                let seg = segments[i]
+
+                // Code block
+                if let cb = seg.flags.codeBlock {
+                    var para: [Segment] = []
+                    flushParagraph(&para)
+                    blocks.append(.codeBlock(language: cb.language, content: cb.content))
+                    i += 1
+                    continue
+                }
+
+                // Heading
+                if let level = seg.flags.headingLevel {
+                    var headingSegs: [Segment] = []
+                    var j = i
+                    while j < segments.count, segments[j].flags.headingLevel == level {
+                        headingSegs.append(segments[j])
+                        j += 1
+                    }
+                    blocks.append(.heading(level: level, segments: headingSegs))
+                    lastWasBlank = false
+                    i = j
+                    continue
+                }
+
+                // List (ordered / unordered)
+                if let lm = seg.flags.listMetadata {
+                    let isOrdered = lm.kind == .ordered
+                    var allItems: [[Segment]] = []
+                    var j = i
+                    var currentItemOrdinal = lm.ordinal
+                    var currentItem: [Segment] = []
+
+                    func flushItem() {
+                        if !currentItem.isEmpty {
+                            allItems.append(currentItem)
+                            currentItem.removeAll()
+                        }
+                    }
+
+                    while j < segments.count {
+                        let s = segments[j]
+                        guard let meta = s.flags.listMetadata,
+                            meta.kind == lm.kind
+                        else { break }
+
+                        // New item if ordinal changes
+                        if meta.ordinal != currentItemOrdinal {
+                            flushItem()
+                            currentItemOrdinal = meta.ordinal
+                        }
+                        currentItem.append(s)
+                        j += 1
+                    }
+                    flushItem()
+                    // Canonical renumber: ignore original ordinals
+                    if isOrdered {
+                        blocks.append(.orderedList(items: allItems))
+                    } else {
+                        blocks.append(.unorderedList(items: allItems))
+                    }
+                    lastWasBlank = false
+                    i = j
+                    continue
+                }
+
+                // Block quote
+                if let depth = seg.flags.blockQuoteDepth {
+                    var lines: [[Segment]] = []
+                    var currentLine: [Segment] = []
+                    var j = i
+                    func flushLine() {
+                        if !currentLine.isEmpty {
+                            lines.append(currentLine)
+                            currentLine.removeAll()
+                        }
+                    }
+                    while j < segments.count {
+                        let s = segments[j]
+                        guard s.flags.blockQuoteDepth == depth else { break }
+                        // Line break detection: explicit newline characters inside segment
+                        let parts = s.text.split(separator: "\n", omittingEmptySubsequences: false)
+                        for (idx, part) in parts.enumerated() {
+                            if !part.isEmpty {
+                                currentLine.append(
+                                    Segment(
+                                        text: String(part), flags: stripBlockAttributes(s.flags)))
+                            }
+                            // If not last part, this was a newline => flush line
+                            if idx < parts.count - 1 {
+                                flushLine()
+                            }
+                        }
+                        j += 1
+                    }
+                    flushLine()
+                    // If quote produced no lines (e.g., empty), skip
+                    if !lines.isEmpty {
+                        if !lines.isEmpty {
+                            blocks.append(.blockQuote(depth: depth, lines: lines))
+                            lastWasBlank = false
+                        }
+                        i = j
+                        continue
+                    }
+
+                    // Blank line detection (pure newline or whitespace+newline)
+                    if seg.text == "\n" || seg.text == "\r\n" {
+                        if !lastWasBlank {
+                            blocks.append(.blank)
+                            lastWasBlank = true
+                        }
+                        i += 1
+                        continue
+                    }
+
+                    // Paragraph accumulation
+                    var paragraphSegments: [Segment] = []
+                    var k = i
+                    while k < segments.count {
+                        let s = segments[k]
+                        if s.flags.headingLevel != nil || s.flags.listMetadata != nil
+                            || s.flags.blockQuoteDepth != nil || s.flags.codeBlock != nil
+                        {
+                            break
+                        }
+                        // Stop paragraph on isolated blank newline
+                        if s.text == "\n" || s.text == "\r\n" {
+                            break
+                        }
+                        paragraphSegments.append(s)
+                        j += 1
+                    }
+                    if !paragraphSegments.isEmpty {
+                        blocks.append(.paragraph(paragraphSegments))
+                        lastWasBlank = false
+                        i = j
+                        continue
+                    }
+
+                    // Fallback: treat as paragraph
+                    blocks.append(.paragraph([seg]))
+                    lastWasBlank = false
+                    i += 1
+                }
+
+                // Normalize consecutive blanks
+                var normalized: [Block] = []
+                // Suppress .blank immediately following structural blocks that already enforce spacing (heading, list, code).
+                var filtered: [Block] = []
+                for (_, b) in blocks.enumerated() {
+                    if case .blank = b {
+                        if let last = filtered.last, BlockRenderer.isStructural(last) {
+                            continue
+                        }
+                    }
+                    filtered.append(b)
+                }
+
+                for (originalIndex, b) in filtered.enumerated() {
+                    let isLast = originalIndex == filtered.count - 1
+                    if case .blank = b, case .blank = normalized.last ?? .paragraph([]) {
+                        continue
+                    }
+                    normalized.append(b)
+                }
+                return normalized
+            }
+        }
+
+        // Rendering
         private struct BlockRenderer {
             static func isStructural(_ block: Block) -> Bool {
                 switch block {
@@ -606,174 +789,6 @@ private enum InlineSerializer {
                 if !body.hasSuffix("\n") { body.append("\n") }
                 return "\(header)\n\(body)\(fence)\n\n"
             }
-        }
-
-        static func render(_ blocks: [Block]) -> String {
-            BlockRenderer.render(blocks)
-        }
-        static func buildBlocks(from segments: [Segment]) -> [Block] {
-            var blocks: [Block] = []
-            var i = 0
-            var lastWasBlank = false
-
-            while i < segments.count {
-                let seg = segments[i]
-
-                // Code block
-                if let cb = seg.flags.codeBlock {
-                    blocks.append(.codeBlock(language: cb.language, content: cb.content))
-                    i += 1
-                    lastWasBlank = false
-                    continue
-                }
-
-                // Heading
-                if let level = seg.flags.headingLevel {
-                    var headingSegs: [Segment] = []
-                    var j = i
-                    while j < segments.count, segments[j].flags.headingLevel == level {
-                        headingSegs.append(segments[j])
-                        j += 1
-                    }
-                    blocks.append(.heading(level: level, segments: headingSegs))
-                    lastWasBlank = false
-                    i = j
-                    continue
-                }
-
-                // List
-                if let lm = seg.flags.listMetadata {
-                    let isOrdered = lm.kind == .ordered
-                    var allItems: [[Segment]] = []
-                    var j = i
-                    var currentOrdinal = lm.ordinal
-                    var currentItem: [Segment] = []
-
-                    func flushItem() {
-                        if !currentItem.isEmpty {
-                            allItems.append(currentItem)
-                            currentItem.removeAll()
-                        }
-                    }
-
-                    while j < segments.count {
-                        let s = segments[j]
-                        guard let meta = s.flags.listMetadata, meta.kind == lm.kind else { break }
-                        if meta.ordinal != currentOrdinal {
-                            flushItem()
-                            currentOrdinal = meta.ordinal
-                        }
-                        currentItem.append(s)
-                        j += 1
-                    }
-                    flushItem()
-                    blocks.append(
-                        isOrdered ? .orderedList(items: allItems) : .unorderedList(items: allItems))
-                    lastWasBlank = false
-                    i = j
-                    continue
-                }
-
-                // Block quote
-                if let depth = seg.flags.blockQuoteDepth {
-                    var lines: [[Segment]] = []
-                    var currentLine: [Segment] = []
-                    var j = i
-
-                    func flushLine() {
-                        if !currentLine.isEmpty {
-                            lines.append(currentLine)
-                            currentLine.removeAll()
-                        }
-                    }
-
-                    while j < segments.count {
-                        let s = segments[j]
-                        guard s.flags.blockQuoteDepth == depth else { break }
-                        let parts = s.text.split(separator: "\n", omittingEmptySubsequences: false)
-                        for (idx, part) in parts.enumerated() {
-                            if !part.isEmpty {
-                                currentLine.append(
-                                    Segment(
-                                        text: String(part), flags: stripBlockAttributes(s.flags)))
-                            }
-                            if idx < parts.count - 1 {
-                                flushLine()
-                            }
-                        }
-                        j += 1
-                    }
-                    flushLine()
-                    if !lines.isEmpty {
-                        blocks.append(.blockQuote(depth: depth, lines: lines))
-                        lastWasBlank = false
-                        i = j
-                        continue
-                    }
-                }
-
-                // Blank line
-                if seg.text == "\n" || seg.text == "\r\n" {
-                    if !lastWasBlank {
-                        blocks.append(.blank)
-                        lastWasBlank = true
-                    }
-                    i += 1
-                    continue
-                }
-
-                // Paragraph
-                var para: [Segment] = []
-                var j = i
-                while j < segments.count {
-                    let s = segments[j]
-                    if s.flags.headingLevel != nil || s.flags.listMetadata != nil
-                        || s.flags.blockQuoteDepth != nil || s.flags.codeBlock != nil
-                    {
-                        break
-                    }
-                    if s.text == "\n" || s.text == "\r\n" { break }
-                    para.append(s)
-                    j += 1
-                }
-                if !para.isEmpty {
-                    blocks.append(.paragraph(para))
-                    lastWasBlank = false
-                    i = j
-                    continue
-                }
-
-                // Fallback (single segment paragraph)
-                blocks.append(.paragraph([seg]))
-                lastWasBlank = false
-                i += 1
-            }
-
-            // Post-loop normalization
-            var normalized: [Block] = []
-            for (idx, b) in blocks.enumerated() {
-                if case .blank = b {
-                    if idx == 0 { continue }
-                    if let last = normalized.last, case .blank = last { continue }
-                    if let last = normalized.last, BlockRenderer.isStructural(last) { continue }
-                }
-                normalized.append(b)
-            }
-            // Preserve final blank line if the preceding block is structural (heading, list, code block, quote).
-            if let last = normalized.last, case .blank = last {
-                if normalized.count >= 2 {
-                    switch normalized[normalized.count - 2] {
-                    case .paragraph:
-                        normalized.removeLast()
-                    default:
-                        break  // keep it for structural predecessor
-                    }
-                } else {
-                    // Leading blank: drop
-                    normalized.removeLast()
-                }
-            }
-            return normalized
         }
         // Helper to strip block-only attributes when embedding segment text inside larger block contexts.
         private static func stripBlockAttributes(_ f: InlineFlags) -> InlineFlags {
