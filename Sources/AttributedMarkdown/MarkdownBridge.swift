@@ -1,6 +1,20 @@
 import Foundation
 import Markdown
 
+// MARK: - Shared Block Metadata Types (must appear before attribute declarations)
+
+/// Metadata for list items (applied per run that belongs to a single list item).
+/// `ordinal` is 1-based for ordered lists; for unordered lists it's the sequential
+/// item index (used only for deterministic ordering when re‑emitting).
+public struct ListMetadata: Hashable, Codable {
+    public enum Kind: String, Codable, Hashable {
+        case unordered
+        case ordered
+    }
+    public let kind: Kind
+    public let ordinal: Int
+}
+
 // MARK: - Custom Inline Attribute Scope (Bold / Italic / Code / Strikethrough)
 
 extension AttributeScopes {
@@ -11,6 +25,8 @@ extension AttributeScopes {
         public let italic: ItalicAttribute
         public let code: CodeAttribute
         public let strike: StrikethroughAttribute
+        public let heading: HeadingLevelAttribute
+        public let listItem: ListItemAttribute
 
         public struct BoldAttribute: AttributedStringKey {
             public static let name = "am.bold"
@@ -27,6 +43,14 @@ extension AttributeScopes {
         public struct StrikethroughAttribute: AttributedStringKey {
             public static let name = "am.strike"
             public typealias Value = Bool
+        }
+        public struct HeadingLevelAttribute: AttributedStringKey {
+            public static let name = "am.heading"
+            public typealias Value = Int
+        }
+        public struct ListItemAttribute: AttributedStringKey {
+            public static let name = "am.listitem"
+            public typealias Value = ListMetadata
         }
     }
 
@@ -97,6 +121,8 @@ private final class InlineAttributedStringRenderer {
         var code = false
         var strike = false
         var link: URL? = nil
+        var headingLevel: Int? = nil
+        var listMetadata: ListMetadata? = nil
     }
 
     private var stack: [StyleContext] = [StyleContext()]
@@ -146,10 +172,66 @@ private final class InlineAttributedStringRenderer {
                 for c in link.children { visit(c) }
             }
 
+        case let heading as Heading:
+            emitHeading(heading)
+        case let ulist as UnorderedList:
+            emitUnorderedList(ulist)
+        case let olist as OrderedList:
+            emitOrderedList(olist)
         default:
-            // Recurse generically for other inline / mixed nodes (they will just flatten).
             for child in markup.children { visit(child) }
         }
+    }
+
+    // MARK: - Block helpers (moved outside switch for correct scope)
+
+    private func appendNewlineIfNeeded() {
+        if output.characters.last != "\n" {
+            output.append(AttributedString("\n"))
+        }
+    }
+
+    private func emitHeading(_ heading: Heading) {
+        let level = max(1, min(heading.level, 6))
+        with {
+            $0.headingLevel = level
+        } body: {
+            for c in heading.children { visit(c) }
+        }
+        // One trailing blank line (heading line + empty line)
+        appendNewlineIfNeeded()
+        appendNewlineIfNeeded()
+    }
+
+    private func emitUnorderedList(_ list: UnorderedList) {
+        var ordinal = 0
+        for item in list.listItems {
+            ordinal += 1
+            handleListItem(item, ordered: false, startIndex: ordinal)
+        }
+        appendNewlineIfNeeded()
+    }
+
+    private func emitOrderedList(_ list: OrderedList) {
+        // Canonical numbering: always restart at 1 regardless of source start index.
+        var idx = 1
+        for item in list.listItems {
+            handleListItem(item, ordered: true, startIndex: idx)
+            idx += 1
+        }
+        appendNewlineIfNeeded()
+    }
+
+    private func handleListItem(_ item: ListItem, ordered: Bool, startIndex: Int) {
+        with {
+            $0.listMetadata = ListMetadata(
+                kind: ordered ? .ordered : .unordered, ordinal: startIndex)
+        } body: {
+            for child in item.children {
+                visit(child)
+            }
+        }
+        appendNewlineIfNeeded()
     }
 
     // Push / mutate context
@@ -181,6 +263,12 @@ private final class InlineAttributedStringRenderer {
         if let link = ctx.link {
             run[AttributeScopes.FoundationAttributes.LinkAttribute.self] = link
         }
+        if let heading = ctx.headingLevel {
+            run[AttributeScopes.AMInlineAttributes.HeadingLevelAttribute.self] = heading
+        }
+        if let lm = ctx.listMetadata {
+            run[AttributeScopes.AMInlineAttributes.ListItemAttribute.self] = lm
+        }
 
         output.append(run)
     }
@@ -190,12 +278,16 @@ private final class InlineAttributedStringRenderer {
 
 private enum InlineSerializer {
 
+    // (Using global ListMetadata defined above the attribute scope for block-level reconstruction)
+
     struct InlineFlags: Equatable {
         var bold = false
         var italic = false
         var code = false
         var strike = false
         var link: URL? = nil
+        var headingLevel: Int? = nil
+        var listMetadata: ListMetadata? = nil
 
         var styleOnlyKey: StyleKey {
             StyleKey(bold: bold, italic: italic, code: code, strike: strike, link: link != nil)
@@ -211,26 +303,92 @@ private enum InlineSerializer {
     }
 
     static func serialize(_ attributed: AttributedString) -> String {
-        // Collect contiguous segments with identical style flags.
+        // Phase 1: collect raw segments (merging identical inline flags).
         var segments: [(InlineFlags, String)] = []
         for run in attributed.runs {
             let flags = extract(run)
             let text = String(attributed[run.range].characters)
             guard !text.isEmpty else { continue }
-
             if let last = segments.last, last.0 == flags {
-                // Merge
                 segments[segments.count - 1].1.append(text)
             } else {
                 segments.append((flags, text))
             }
         }
 
-        // Emit
+        // Phase 2: canonical emission with grouping to allow a single outer bold (and/or strike + link)
+        // with nested *italic* spans inside, producing the desired form:
+        //   **This *that*** (instead of **This *****that***)
         var result = String()
-        for (flags, text) in segments {
-            result.append(renderSegment(text, flags))
+        var i = 0
+        while i < segments.count {
+            let (flags, text) = segments[i]
+
+            // Code segments remain isolated (with optional link wrapping).
+            if flags.code {
+                result.append(renderCodeSegment(text, flags))
+                i += 1
+                continue
+            }
+            // Block-level: heading
+            if let h = flags.headingLevel {
+                result.append(renderHeading(h, text: text, flags: flags))
+                i += 1
+                continue
+            }
+            if let lm = flags.listMetadata {
+                result.append(renderListItem(lm, text: text, flags: flags))
+                i += 1
+                continue
+            }
+
+            // Group by non-italic style signature (bold / strike / link), excluding code & block-level.
+            let keyBold = flags.bold
+            let keyStrike = flags.strike
+            let keyLink = flags.link
+
+            var group: [(InlineFlags, String)] = []
+            var j = i
+            while j < segments.count {
+                let next = segments[j]
+                let nf = next.0
+                if !nf.code && nf.bold == keyBold && nf.strike == keyStrike && nf.link == keyLink {
+                    group.append(next)
+                    j += 1
+                } else {
+                    break
+                }
+            }
+
+            // Build inner content (italic spans wrapped individually).
+            var inner = String()
+            inner.reserveCapacity(group.reduce(0) { $0 + $1.1.count + 4 })
+
+            for (gFlags, gText) in group {
+                let esc = escapePlain(gText)
+                if gFlags.italic {
+                    inner.append("*\(esc)*")
+                } else {
+                    inner.append(esc)
+                }
+            }
+
+            // Wrap outer styles (strike then bold) around the entire grouped region.
+            // Canonical wrapper order: italic already applied inside, then bold, then strike outermost, then link.
+            if keyBold {
+                inner = "**\(inner)**"
+            }
+            if keyStrike {
+                inner = "~~\(inner)~~"
+            }
+            if let link = keyLink {
+                inner = "[\(inner)](\(escapeLinkDestination(link)))"
+            }
+
+            result.append(inner)
+            i = j
         }
+
         return result
     }
 
@@ -244,8 +402,20 @@ private enum InlineSerializer {
         if run[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self] == true {
             out.strike = true
         }
+        if let h = run[AttributeScopes.AMInlineAttributes.HeadingLevelAttribute.self] {
+            out.headingLevel = h
+        }
+        if let lm = run[AttributeScopes.AMInlineAttributes.ListItemAttribute.self] {
+            out.listMetadata = lm
+        }
         if let link = run[AttributeScopes.FoundationAttributes.LinkAttribute.self] {
             out.link = link
+        }
+        if let h = run[AttributeScopes.AMInlineAttributes.HeadingLevelAttribute.self] {
+            out.headingLevel = h
+        }
+        if let lm = run[AttributeScopes.AMInlineAttributes.ListItemAttribute.self] {
+            out.listMetadata = lm
         }
         // Code overrides other styling semantics (code text not wrapped by emphasis markers).
         if out.code {
@@ -256,24 +426,44 @@ private enum InlineSerializer {
         return out
     }
 
-    private static func renderSegment(_ raw: String, _ flags: InlineFlags) -> String {
+    // Render a heading line
+    private static func renderHeading(_ level: Int, text: String, flags: InlineFlags) -> String {
+        var innerFlags = flags
+        innerFlags.headingLevel = nil
+        innerFlags.listMetadata = nil
+        let rendered = renderPlainStyled(text, flags: innerFlags)
+        let hashes = String(repeating: "#", count: max(1, min(level, 6)))
+        // Heading line plus a blank line after.
+        return "\(hashes) \(rendered)\n\n"
+    }
+
+    // Render a list item line
+    private static func renderListItem(_ meta: ListMetadata, text: String, flags: InlineFlags)
+        -> String
+    {
+        var innerFlags = flags
+        innerFlags.listMetadata = nil
+        innerFlags.headingLevel = nil
+        let body = renderPlainStyled(text, flags: innerFlags)
+        let prefix: String
+        switch meta.kind {
+        case .unordered: prefix = "- "
+        case .ordered: prefix = "\(meta.ordinal). "
+        }
+        return "\(prefix)\(body)\n"
+    }
+
+    // Render plain styled (non-heading / non-list) text segment with inline wrappers
+    private static func renderPlainStyled(_ raw: String, flags: InlineFlags) -> String {
         if flags.code {
-            let fenced = wrapCode(raw)
-            if let link = flags.link {
-                return "[\(fenced)](\(escapeLinkDestination(link)))"
-            }
-            return fenced
+            return renderCodeSegment(raw, flags)
         }
-
         var core = escapePlain(raw)
-
-        // Apply inner wrappers first (bold, italic), then outer strike for canonical form so the emitted
-        // Markdown shows strike as the outermost wrapper: ~~**text**~~ or ~~***text***~~.
-        if flags.bold {
-            core = "**\(core)**"
-        }
         if flags.italic {
             core = "*\(core)*"
+        }
+        if flags.bold {
+            core = "**\(core)**"
         }
         if flags.strike {
             core = "~~\(core)~~"
@@ -282,6 +472,15 @@ private enum InlineSerializer {
             core = "[\(core)](\(escapeLinkDestination(link)))"
         }
         return core
+    }
+
+    // Render a code segment (code supersedes other style wrappers; link may wrap it).
+    private static func renderCodeSegment(_ raw: String, _ flags: InlineFlags) -> String {
+        let fenced = wrapCode(raw)
+        if let link = flags.link {
+            return "[\(fenced)](\(escapeLinkDestination(link)))"
+        }
+        return fenced
     }
 
     // MARK: Escaping
@@ -353,11 +552,8 @@ private enum InlineSerializer {
 
 // MARK: - Notes / Future Extensions
 //
-// - Headings / Lists / Blockquotes:
-//     Will require either custom attributes or mapping to PresentationIntent (once consistently available).
-// - Fenced Code Blocks:
-//     Need block-level detection; a heuristic: multi-line code segments originally parsed as CodeBlock can be
-//     tagged via a custom attribute. Absent that, inline code remains the only emission.
+// - Block Quotes & Fenced Code Blocks:
+//     Not yet implemented; would require additional block metadata (e.g. quote depth, code language).
 // - Run Coalescing:
 //     Already coalesces identical styles for cleaner output.
 // - Smart Escapes:
@@ -365,6 +561,8 @@ private enum InlineSerializer {
 // - Performance:
 //     Current implementation is suitable for typical UI/editor content sizes. For very large documents
 //     consider a single pass building ranges with a small builder object.
+// - Attribute Strategy:
+//     Headings (H1–H6) and lists now round-trip via custom attributes (am.heading / am.listitem).
 //
-// This phase focuses on reliability & determinism for inline round-trips.
+// This phase currently focuses on reliable inline + basic block (headings, lists) round-trips.
 //

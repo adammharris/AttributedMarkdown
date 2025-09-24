@@ -129,5 +129,39 @@ final class AttributedMarkdownTests: XCTestCase {
             attr, reparsed,
             "Re-serialized markdown did not round-trip equivalently via inline bridge.\nOriginal MD: \(original)\nSerialized: \(back)"
         )
+        // MARK: - Headings & Lists (Block-Level)
+
+        func testHeadingLevelsRoundTrip() throws {
+            let md = "# H1\n\n## H2\n\n### H3\n\n#### H4\n\n##### H5\n\n###### H6\n\n"
+            try assertRoundTripBridge(md)
+        }
+
+        func testUnorderedListRoundTrip() throws {
+            // Serializer emits a trailing newline after the list; include it in expected.
+            let md = "- one\n- two\n- three\n"
+            try assertRoundTripBridge(md)
+        }
+
+        func testOrderedListCanonicalNumbering() throws {
+            // Even if source started elsewhere, we canonicalize to 1., 2., ...
+            let source = "3. third\n4. fourth\n"
+            // Expected canonical form:
+            let expected = "1. third\n2. fourth\n"
+            let attr = AttributedString(inlineMarkdown: source)
+            let back = attr.toMarkdown()
+            XCTAssertEqual(expected, back, "Ordered list should be renumbered starting at 1.")
+            // Round-trip the expected canonical form.
+            try assertRoundTripBridge(expected)
+        }
+
+        func testInlineStylingInHeading() throws {
+            let md = "## **Bold** and *italic* in heading\n\n"
+            try assertRoundTripBridge(md)
+        }
+
+        func testInlineStylingInListItems() throws {
+            let md = "- **Bold** item\n- *Italic* item\n- ~~***StrikeAll***~~ item\n"
+            try assertRoundTripBridge(md)
+        }
     }
 }
