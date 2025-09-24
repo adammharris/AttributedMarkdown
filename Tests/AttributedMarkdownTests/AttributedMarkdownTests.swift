@@ -156,8 +156,57 @@ final class AttributedMarkdownTests: XCTestCase {
         try assertRoundTripBridge(md)
     }
 
+    #if DEBUG
+        /// DEBUG helper: dumps attributed runs (text + key block-level attributes) and the
+        /// re-serialized markdown so we can inspect where block quote depth is lost.
+        private func debugDumpMarkdownSegments(_ markdown: String) {
+            let attr = AttributedString(inlineMarkdown: markdown)
+            print("=== DEBUG INPUT ===")
+            print(markdown)
+            print("=== RUNS ===")
+            var idx = 0
+            for run in attr.runs {
+                let slice = attr[run.range]
+                let text = String(slice.characters)
+                var flags: [String] = []
+                if let bq = run[AttributeScopes.AMInlineAttributes.BlockQuoteAttribute.self] {
+                    flags.append("bqDepth=\(bq.depth)")
+                }
+                if let lm = run[AttributeScopes.AMInlineAttributes.ListItemAttribute.self] {
+                    flags.append("list=\(lm.kind == .ordered ? "ol" : "ul")#\(lm.ordinal)")
+                }
+                if let h = run[AttributeScopes.AMInlineAttributes.HeadingLevelAttribute.self] {
+                    flags.append("h\(h)")
+                }
+                if run[AttributeScopes.AMInlineAttributes.CodeAttribute.self] == true {
+                    flags.append("code")
+                }
+                if run[AttributeScopes.AMInlineAttributes.BoldAttribute.self] == true {
+                    flags.append("bold")
+                }
+                if run[AttributeScopes.AMInlineAttributes.ItalicAttribute.self] == true {
+                    flags.append("italic")
+                }
+                if run[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self] == true {
+                    flags.append("strike")
+                }
+                if let link = run[AttributeScopes.FoundationAttributes.LinkAttribute.self] {
+                    flags.append("link=\(link)")
+                }
+                print("[\(idx)] \"\(text)\" \(flags)")
+                idx += 1
+            }
+            print("=== RE-SERIALIZED ===")
+            print(attr.toMarkdownViaAST())
+            print("=== END DEBUG ===")
+        }
+    #endif
+
     func testNestedBlockQuotes() throws {
         let md = "> Outer\n> > Inner\n> Back to outer\n"
+        #if DEBUG
+            debugDumpMarkdownSegments(md)
+        #endif
         try assertRoundTripBridge(md)
     }
 

@@ -121,9 +121,12 @@ public enum MarkdownBridgeInline {
 
 extension AttributedString {
 
-    /// Create an attributed string from Markdown using the swift-markdown parser and the inline custom attribute scope.
+    /// Create an attributed string from Markdown using the swift-markdown parser and then
+    /// normalize block quote depths line-by-line to preserve round-trip fidelity for
+    /// nested quotes whose depth decreases (e.g. `> > Inner` followed by `> Back`).
     public init(inlineMarkdown markdown: String) {
-        self = MarkdownBridgeInline.parse(markdown)
+        let provisional = MarkdownBridgeInline.parse(markdown)
+        self = QuoteDepthNormalizer.normalize(original: markdown, provisional: provisional)
     }
 
     /// Inline-only Markdown serialization (AST-backed attribute model).
