@@ -38,8 +38,8 @@ import Foundation
 
 extension AttributedString {
     public func toMarkdown() -> String {
-        // Delegates to the new AST-based inline bridge serializer.
-        // (Block-level features will be integrated into the bridge in subsequent steps.)
+        // Uses the unified AST-based serializer for full inline + block-level (headings, lists,
+        // block quotes, code fences) round-trip support.
         return self.toMarkdownViaAST()
     }
 }
