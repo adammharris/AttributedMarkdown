@@ -38,7 +38,9 @@ import Foundation
 
 extension AttributedString {
     public func toMarkdown() -> String {
-        MarkdownSerializer.serialize(self)
+        // Delegates to the new AST-based inline bridge serializer.
+        // (Block-level features will be integrated into the bridge in subsequent steps.)
+        return self.toMarkdownViaAST()
     }
 }
 

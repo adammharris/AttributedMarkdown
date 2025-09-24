@@ -119,17 +119,15 @@ final class AttributedMarkdownTests: XCTestCase {
     // MARK: - Nested Emphasis Variation (Parser Canonicalization)
 
     func testNestedItalicInsideBoldOriginalVariant() throws {
-        // Provide a variant with explicit nesting. Parser may normalize; we assert serializer matches parser output.
+        // Use the new inline bridge so we only test our serializer / parser pair, not Foundation's.
         let original = "**This *that***"
-        let attr = try AttributedString(markdown: original)
+        let attr = AttributedString(inlineMarkdown: original)
         let back = attr.toMarkdown()
-        // We don't assert equality with 'original' if parser normalizes differently; instead ensure a valid structure.
-        // Current serializer wraps bold then italic producing ***This that*** (if run merged) or a combination.
-        // We'll at least ensure the back markdown re-parses to an equivalent attributed string.
-        let reparsed = try AttributedString(markdown: back)
+        // Reparse through the same bridge.
+        let reparsed = AttributedString(inlineMarkdown: back)
         XCTAssertEqual(
             attr, reparsed,
-            "Re-serialized markdown did not produce equivalent attributed content.\nOriginal MD: \(original)\nSerialized: \(back)"
+            "Re-serialized markdown did not round-trip equivalently via inline bridge.\nOriginal MD: \(original)\nSerialized: \(back)"
         )
     }
 }
