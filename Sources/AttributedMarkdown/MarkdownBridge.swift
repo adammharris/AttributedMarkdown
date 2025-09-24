@@ -107,6 +107,10 @@ public enum MarkdownBridgeInline {
         let document = Document(parsing: markdown)
         let renderer = InlineAttributedStringRenderer()
         renderer.visit(document)
+        // Preserve a trailing single newline from the original source if the AST did not produce one.
+        if markdown.hasSuffix("\n"), renderer.output.characters.last != "\n" {
+            renderer.output.append(AttributedString("\n"))
+        }
         return renderer.output
     }
 
@@ -162,6 +166,12 @@ private final class InlineAttributedStringRenderer {
 
         case let text as Text:
             append(text.string)
+
+        case _ as SoftBreak:
+            append("\n")
+
+        case _ as LineBreak:
+            append("\n")
 
         case let strong as Strong:
             with {
@@ -228,9 +238,6 @@ private final class InlineAttributedStringRenderer {
         } body: {
             for c in heading.children { visit(c) }
         }
-        // One trailing blank line (heading line + empty line)
-        appendNewlineIfNeeded()
-        appendNewlineIfNeeded()
     }
 
     private func emitUnorderedList(_ list: UnorderedList) {
@@ -277,13 +284,7 @@ private final class InlineAttributedStringRenderer {
             } body: {
                 visit(child)
             }
-            if i < childrenArray.count - 1 {
-                // Preserve quote depth on newline so it remains part of the block quote lines.
-                var nl = AttributedString("\n")
-                nl[AttributeScopes.AMInlineAttributes.BlockQuoteAttribute.self] =
-                    BlockQuoteMetadata(depth: depth)
-                output.append(nl)
-            }
+            // Do not append raw newlines here; BlockRenderer will manage spacing.
         }
         // Spacing handled in renderer; don't append extra blank line here.
     }
@@ -556,33 +557,128 @@ private enum InlineSerializer {
                     }
                 }
 
-                // Blank line
+                // Newline handling (soft vs hard)
                 if seg.text == "\n" || seg.text == "\r\n" {
-                    if !lastWasBlank {
-                        blocks.append(.blank)
-                        lastWasBlank = true
+                    // Look ahead: double newline => hard paragraph break (.blank)
+                    let nextIsNewline =
+                        (i + 1 < segments.count)
+                        && (segments[i + 1].text == "\n" || segments[i + 1].text == "\r\n")
+                    if nextIsNewline {
+                        if !lastWasBlank {
+                            blocks.append(.blank)
+                            lastWasBlank = true
+                        }
+                        // Consume exactly one newline here; the next iteration will see the second
+                        // newline and skip adding another blank because lastWasBlank is true.
+                        i += 1
+                        continue
+                    } else {
+                        // Single newline = soft line break.
+                        // If the previous emitted block is a paragraph, merge this newline into its last segment;
+                        // otherwise, ignore it (prevents creating a standalone blank paragraph).
+                        if let last = blocks.last {
+                            switch last {
+                            case .paragraph(var prevSegs):
+                                if !prevSegs.isEmpty {
+                                    let lastSeg = prevSegs.removeLast()
+                                    let merged = Segment(
+                                        text: lastSeg.text + "\n", flags: lastSeg.flags)
+                                    prevSegs.append(merged)
+                                    blocks.removeLast()
+                                    blocks.append(.paragraph(prevSegs))
+                                }
+                            default:
+                                break
+                            }
+                        }
+                        i += 1
+                        lastWasBlank = false
+                        continue
                     }
-                    i += 1
-                    continue
                 }
 
-                // Paragraph
+                // Paragraph accumulation with simplified soft break handling.
+                // Strategy:
+                //  - A single newline after text is merged into the previous segment's text as a literal '\n'.
+                //  - Two consecutive newline segments (or a segment that is exactly "\n" followed by another) terminate the paragraph (hard break).
                 var para: [Segment] = []
                 var j = i
                 while j < segments.count {
                     let s = segments[j]
+                    // Structural boundaries end the paragraph.
                     if s.flags.headingLevel != nil || s.flags.listMetadata != nil
                         || s.flags.blockQuoteDepth != nil || s.flags.codeBlock != nil
                     {
                         break
                     }
-                    if s.text == "\n" || s.text == "\r\n" { break }
+
+                    // Standalone newline segment
+                    if s.text == "\n" || s.text == "\r\n" {
+                        let nextIsNewline =
+                            (j + 1 < segments.count)
+                            && (segments[j + 1].text == "\n" || segments[j + 1].text == "\r\n")
+                        if nextIsNewline {
+                            // Hard break: stop paragraph; outer loop handles blank.
+                            break
+                        } else {
+                            // Soft break: merge into previous segment if any; if paragraph empty, ignore (avoid creating empty paragraph).
+                            if let last = para.popLast() {
+                                let merged = Segment(text: last.text + "\n", flags: last.flags)
+                                para.append(merged)
+                            } else {
+                                // No prior content; ignore solitary leading soft newline.
+                            }
+                            j += 1
+                            continue
+                        }
+                    }
+
+                    // Segment with embedded newlines (split into soft / hard)
+                    if s.text.contains("\n") || s.text.contains("\r\n") {
+                        let normalized = s.text.replacingOccurrences(of: "\r\n", with: "\n")
+                        var remainder = normalized[normalized.startIndex..<normalized.endIndex]
+                        var encounteredHard = false
+                        while let nl = remainder.firstIndex(of: "\n") {
+                            let before = remainder[..<nl]
+                            let afterStart = remainder.index(after: nl)
+                            if !before.isEmpty {
+                                para.append(Segment(text: String(before), flags: s.flags))
+                            }
+                            // Look ahead to detect double newline
+                            if afterStart < remainder.endIndex, remainder[afterStart] == "\n" {
+                                // Hard break -> paragraph ends (ignore subsequent content; outer loop will see next newline)
+                                encounteredHard = true
+                                remainder = remainder[afterStart...]  // leave next newline for outer loop
+                                break
+                            } else {
+                                // Soft break: merge newline into previous segment
+                                if let last = para.popLast() {
+                                    para.append(Segment(text: last.text + "\n", flags: last.flags))
+                                } else {
+                                    // No previous content; ignore
+                                }
+                                remainder = remainder[afterStart...]
+                            }
+                        }
+                        if !encounteredHard, !remainder.isEmpty {
+                            para.append(Segment(text: String(remainder), flags: s.flags))
+                        }
+                        j += 1
+                        if encounteredHard { break }
+                        continue
+                    }
+
+                    // Regular text segment
                     para.append(s)
                     j += 1
                 }
+
                 if !para.isEmpty {
-                    blocks.append(.paragraph(para))
-                    lastWasBlank = false
+                    // Do not emit a paragraph that is purely a single newline (already merged logic avoids this).
+                    if !(para.count == 1 && (para[0].text == "\n" || para[0].text == "\r\n")) {
+                        blocks.append(.paragraph(para))
+                        lastWasBlank = false
+                    }
                     i = j
                     continue
                 }

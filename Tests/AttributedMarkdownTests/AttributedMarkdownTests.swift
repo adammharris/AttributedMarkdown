@@ -98,6 +98,14 @@ final class AttributedMarkdownTests: XCTestCase {
         XCTAssertEqual(md, "Just plain text.")
     }
 
+    // Soft line break (single newlines within a paragraph) should be preserved.
+    // The serializer now treats single newlines as soft breaks inside the same paragraph,
+    // and only double newlines as hard paragraph separators.
+    func testSoftLineBreakRoundTrip() throws {
+        let md = "Line one\nLine two\nLine three\n"
+        try assertRoundTripBridge(md)
+    }
+
     // MARK: - Mixed Multiple Runs
 
     func testMultipleSequentialStyledRuns() throws {
