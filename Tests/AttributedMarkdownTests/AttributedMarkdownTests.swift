@@ -48,8 +48,6 @@ final class AttributedMarkdownTests: XCTestCase {
     }
 
     func testRoundTripStrikethroughBoldItalic() throws {
-        // Expected emission pattern from serializer: outer ~~ then ** then *
-        // Serializer currently produces: ~~***Hello***~~ for all three.
         try assertRoundTripBridge("~~***Hello***~~")
     }
 
@@ -60,8 +58,6 @@ final class AttributedMarkdownTests: XCTestCase {
     }
 
     func testRoundTripInlineCodeContainingBacktick() throws {
-        // When the code content includes a backtick, serializer should choose a fence length > longest run.
-        // Starting markdown uses double backticks to represent a literal single backtick inside.
         try assertRoundTripBridge("``code`tick``")
     }
 
@@ -70,10 +66,6 @@ final class AttributedMarkdownTests: XCTestCase {
     func testRoundTripSimpleLink() throws {
         try assertRoundTripBridge("[Link](https://example.com)")
     }
-
-    // NOTE: Bold inside a link may currently split into multiple runs, producing repeated link markup.
-    // To avoid a failing test at this stage (since merging is a future enhancement), we only test a plain link.
-    // A future test could assert desired canonical form once run coalescing is implemented.
 
     // MARK: - Strikethrough + Other
 
@@ -84,7 +76,6 @@ final class AttributedMarkdownTests: XCTestCase {
     // MARK: - Escaping
 
     func testEscapingSpecialCharactersLiteralAsterisk() throws {
-        // The input markdown escapes asterisks so they remain literal.
         let md = #"Literal: \*star\* and backslash \\ and underscore \_ ok"#
         try assertRoundTripBridge(md)
     }
@@ -95,7 +86,6 @@ final class AttributedMarkdownTests: XCTestCase {
     }
 
     func testEscapingTildeInPlainText() throws {
-        // Strikethrough marker should remain literal when escaped.
         let md = #"Not strike: \~Hello\~ world"#
         try assertRoundTripBridge(md)
     }
@@ -103,7 +93,6 @@ final class AttributedMarkdownTests: XCTestCase {
     // MARK: - Plain Text (No Formatting)
 
     func testPlainTextNoFormatting() {
-        // Construct directly (not via markdown parser) because markdown "*hello*" would parse as italic.
         let plain = AttributedString("Just plain text.")
         let md = plain.toMarkdown()
         XCTAssertEqual(md, "Just plain text.")
@@ -119,49 +108,83 @@ final class AttributedMarkdownTests: XCTestCase {
     // MARK: - Nested Emphasis Variation (Parser Canonicalization)
 
     func testNestedItalicInsideBoldOriginalVariant() throws {
-        // Use the new inline bridge so we only test our serializer / parser pair, not Foundation's.
         let original = "**This *that***"
         let attr = AttributedString(inlineMarkdown: original)
         let back = attr.toMarkdown()
-        // Reparse through the same bridge.
         let reparsed = AttributedString(inlineMarkdown: back)
         XCTAssertEqual(
             attr, reparsed,
             "Re-serialized markdown did not round-trip equivalently via inline bridge.\nOriginal MD: \(original)\nSerialized: \(back)"
         )
-        // MARK: - Headings & Lists (Block-Level)
+    }
 
-        func testHeadingLevelsRoundTrip() throws {
-            let md = "# H1\n\n## H2\n\n### H3\n\n#### H4\n\n##### H5\n\n###### H6\n\n"
-            try assertRoundTripBridge(md)
-        }
+    // MARK: - Headings & Lists (Block-Level)
 
-        func testUnorderedListRoundTrip() throws {
-            // Serializer emits a trailing newline after the list; include it in expected.
-            let md = "- one\n- two\n- three\n"
-            try assertRoundTripBridge(md)
-        }
+    func testHeadingLevelsRoundTrip() throws {
+        let md = "# H1\n\n## H2\n\n### H3\n\n#### H4\n\n##### H5\n\n###### H6\n\n"
+        try assertRoundTripBridge(md)
+    }
 
-        func testOrderedListCanonicalNumbering() throws {
-            // Even if source started elsewhere, we canonicalize to 1., 2., ...
-            let source = "3. third\n4. fourth\n"
-            // Expected canonical form:
-            let expected = "1. third\n2. fourth\n"
-            let attr = AttributedString(inlineMarkdown: source)
-            let back = attr.toMarkdown()
-            XCTAssertEqual(expected, back, "Ordered list should be renumbered starting at 1.")
-            // Round-trip the expected canonical form.
-            try assertRoundTripBridge(expected)
-        }
+    func testUnorderedListRoundTrip() throws {
+        let md = "- one\n- two\n- three\n"
+        try assertRoundTripBridge(md)
+    }
 
-        func testInlineStylingInHeading() throws {
-            let md = "## **Bold** and *italic* in heading\n\n"
-            try assertRoundTripBridge(md)
-        }
+    func testOrderedListCanonicalNumbering() throws {
+        let source = "3. third\n4. fourth\n"
+        let expected = "1. third\n2. fourth\n"
+        let attr = AttributedString(inlineMarkdown: source)
+        let back = attr.toMarkdown()
+        XCTAssertEqual(expected, back, "Ordered list should be renumbered starting at 1.")
+        try assertRoundTripBridge(expected)
+    }
 
-        func testInlineStylingInListItems() throws {
-            let md = "- **Bold** item\n- *Italic* item\n- ~~***StrikeAll***~~ item\n"
-            try assertRoundTripBridge(md)
-        }
+    func testInlineStylingInHeading() throws {
+        let md = "## **Bold** and *italic* in heading\n\n"
+        try assertRoundTripBridge(md)
+    }
+
+    func testInlineStylingInListItems() throws {
+        let md = "- **Bold** item\n- *Italic* item\n- ~~***StrikeAll***~~ item\n"
+        try assertRoundTripBridge(md)
+    }
+
+    // MARK: - Block Quotes
+
+    func testSingleBlockQuote() throws {
+        let md = "> Quoted line\n"
+        try assertRoundTripBridge(md)
+    }
+
+    func testNestedBlockQuotes() throws {
+        let md = "> Outer\n> > Inner\n> Back to outer\n"
+        try assertRoundTripBridge(md)
+    }
+
+    func testBlockQuoteWithInlineStyles() throws {
+        let md = "> **Bold** and *italic* and ~~strike~~ inside quote\n"
+        try assertRoundTripBridge(md)
+    }
+
+    // MARK: - Fenced Code Blocks
+
+    func testFencedCodeBlockSimple() throws {
+        let md = "```\nprint(\"Hello\")\n```\n\n"
+        try assertRoundTripBridge(md)
+    }
+
+    func testFencedCodeBlockWithLanguage() throws {
+        let md = "```swift\nlet x = 1\n```\n\n"
+        try assertRoundTripBridge(md)
+    }
+
+    func testFencedCodeBlockContainingBackticks() throws {
+        let md = "````\n```\ninner fenced\n```\n````\n\n"
+        try assertRoundTripBridge(md)
+    }
+
+    func testBlockQuoteContainingCodeBlock() throws {
+        let md = "> Intro\n\n```swift\nprint(\"hi\")\n```\n\n"
+        try assertRoundTripBridge(md)
     }
 }
