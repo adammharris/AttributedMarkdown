@@ -1,6 +1,9 @@
 import XCTest
 
 @testable import AttributedMarkdown
+#if canImport(SwiftUI)
+    import SwiftUI
+#endif
 
 final class AttributedMarkdownTests: XCTestCase {
 
@@ -51,6 +54,37 @@ final class AttributedMarkdownTests: XCTestCase {
         try assertRoundTripBridge("~~***Hello***~~")
     }
 
+#if canImport(SwiftUI)
+    // MARK: - SwiftUI Attribute Scope Bridging
+
+    func testSwiftUIInlineIntentBoldRoundTrip() {
+        guard #available(macOS 13, iOS 16, tvOS 16, watchOS 9, *) else { return }
+        var attr = AttributedString("Bold")
+        attr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = Font.body.bold()
+        XCTAssertEqual("**Bold**", attr.toMarkdown())
+    }
+
+    func testSwiftUIInlineIntentItalicRoundTrip() {
+        guard #available(macOS 13, iOS 16, tvOS 16, watchOS 9, *) else { return }
+        var attr = AttributedString("Italic")
+        attr[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = Font.body.italic()
+        XCTAssertEqual("*Italic*", attr.toMarkdown())
+    }
+
+    func testSwiftUIInlineIntentMixedSegments() {
+        guard #available(macOS 13, iOS 16, tvOS 16, watchOS 9, *) else { return }
+        var composed = AttributedString("Plain ")
+        var bold = AttributedString("Bold")
+        bold[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = Font.body.bold()
+        var italic = AttributedString("Italic")
+        italic[AttributeScopes.SwiftUIAttributes.FontAttribute.self] = Font.body.italic()
+        composed += bold
+        composed += AttributedString(" ")
+        composed += italic
+        XCTAssertEqual("Plain **Bold** *Italic*", composed.toMarkdown())
+    }
+#endif
+
     // MARK: - Code
 
     func testRoundTripInlineCodeSimple() throws {
@@ -96,6 +130,32 @@ final class AttributedMarkdownTests: XCTestCase {
         let plain = AttributedString("Just plain text.")
         let md = plain.toMarkdown()
         XCTAssertEqual(md, "Just plain text.")
+    }
+
+    // MARK: - Basic Encoder (Bold + Italic + Newlines)
+
+    func testBasicEncoderPlainText() {
+        let plain = AttributedString("Plain text\nwith newline")
+        XCTAssertEqual(plain.toBasicMarkdown(), "Plain text\nwith newline")
+    }
+
+    func testBasicEncoderBoldAndItalic() throws {
+        var attributed = AttributedString()
+        var bold = AttributedString("Bold")
+        bold[AttributeScopes.AMInlineAttributes.BoldAttribute.self] = true
+        var italic = AttributedString("Italic")
+        italic[AttributeScopes.AMInlineAttributes.ItalicAttribute.self] = true
+        attributed.append(bold)
+        attributed.append(AttributedString(" "))
+        attributed.append(italic)
+
+        XCTAssertEqual(attributed.toBasicMarkdown(), "**Bold** *Italic*")
+    }
+
+    func testBasicEncoderIgnoresUnsupportedAttributes() {
+        var text = AttributedString("Strike")
+        text[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self] = true
+        XCTAssertEqual(text.toBasicMarkdown(), "Strike")
     }
 
     // Soft line break (single newlines within a paragraph) should be preserved.

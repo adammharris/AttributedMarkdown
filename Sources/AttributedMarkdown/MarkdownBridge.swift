@@ -7,6 +7,9 @@ import Markdown
 #if canImport(AppKit)
     import AppKit
 #endif
+#if canImport(SwiftUI)
+    import SwiftUI
+#endif
 
 // MARK: - Shared Block Metadata Types (must appear before attribute declarations)
 
@@ -175,64 +178,64 @@ private final class InlineAttributedStringRenderer {
     // Entry traversal
     func visit(_ markup: Markup) {
         switch markup {
-        case let doc as Document:
+        case let doc as Markdown.Document:
             for child in doc.children { visit(child) }
 
-        case let text as Text:
+        case let text as Markdown.Text:
             append(text.string)
 
-        case _ as SoftBreak:
+        case _ as Markdown.SoftBreak:
             append("\n")
 
-        case _ as LineBreak:
+        case _ as Markdown.LineBreak:
             append("\n")
 
-        case let strong as Strong:
+        case let strong as Markdown.Strong:
             with {
                 $0.bold = true
             } body: {
                 for c in strong.children { visit(c) }
             }
 
-        case let em as Emphasis:
+        case let em as Markdown.Emphasis:
             with {
                 $0.italic = true
             } body: {
                 for c in em.children { visit(c) }
             }
 
-        case let strike as Strikethrough:
+        case let strike as Markdown.Strikethrough:
             with {
                 $0.strike = true
             } body: {
                 for c in strike.children { visit(c) }
             }
 
-        case let code as InlineCode:
+        case let code as Markdown.InlineCode:
             with {
                 $0.code = true
             } body: {
                 append(code.code)
             }
 
-        case let link as Link:
+        case let link as Markdown.Link:
             with {
                 $0.link = URL(string: link.destination ?? "")
             } body: {
                 for c in link.children { visit(c) }
             }
 
-        case let heading as Heading:
+        case let heading as Markdown.Heading:
             emitHeading(heading)
-        case let ulist as UnorderedList:
+        case let ulist as Markdown.UnorderedList:
             emitUnorderedList(ulist)
-        case let olist as OrderedList:
+        case let olist as Markdown.OrderedList:
             emitOrderedList(olist)
-        case let quote as BlockQuote:
+        case let quote as Markdown.BlockQuote:
             emitBlockQuote(quote, depth: (stack.last?.blockQuoteDepth ?? 0) + 1)
-        case let blockCode as CodeBlock:
+        case let blockCode as Markdown.CodeBlock:
             emitFencedCodeBlock(blockCode)
-        case let para as Paragraph:
+        case let para as Markdown.Paragraph:
             let paragraphID = nextParagraphID
             nextParagraphID += 1
             with {
@@ -247,7 +250,7 @@ private final class InlineAttributedStringRenderer {
 
     // MARK: - Block helpers (moved outside switch for correct scope)
 
-    private func emitHeading(_ heading: Heading) {
+    private func emitHeading(_ heading: Markdown.Heading) {
         let level = max(1, min(heading.level, 6))
         with {
             $0.headingLevel = level
@@ -256,7 +259,7 @@ private final class InlineAttributedStringRenderer {
         }
     }
 
-    private func emitUnorderedList(_ list: UnorderedList) {
+    private func emitUnorderedList(_ list: Markdown.UnorderedList) {
         var ordinal = 0
         for item in list.listItems {
             ordinal += 1
@@ -265,7 +268,7 @@ private final class InlineAttributedStringRenderer {
         // Newlines (with list metadata) are appended per item inside handleListItem.
     }
 
-    private func emitOrderedList(_ list: OrderedList) {
+    private func emitOrderedList(_ list: Markdown.OrderedList) {
         // Canonical numbering: always restart at 1 regardless of source start index.
         var idx = 1
         for item in list.listItems {
@@ -275,7 +278,7 @@ private final class InlineAttributedStringRenderer {
         // Newlines (with list metadata) are appended per item inside handleListItem.
     }
 
-    private func handleListItem(_ item: ListItem, ordered: Bool, startIndex: Int) {
+    private func handleListItem(_ item: Markdown.ListItem, ordered: Bool, startIndex: Int) {
         let metadata = ListMetadata(kind: ordered ? .ordered : .unordered, ordinal: startIndex)
         with {
             $0.listMetadata = metadata
@@ -291,7 +294,7 @@ private final class InlineAttributedStringRenderer {
     }
 
     // BlockQuote
-    private func emitBlockQuote(_ quote: BlockQuote, depth: Int) {
+    private func emitBlockQuote(_ quote: Markdown.BlockQuote, depth: Int) {
         // Apply depth metadata to every appended run inside the quote; no placeholder run.
         let childrenArray = Array(quote.children)
         for child in childrenArray {
@@ -306,7 +309,7 @@ private final class InlineAttributedStringRenderer {
     }
 
     // Fenced Code Block
-    private func emitFencedCodeBlock(_ block: CodeBlock) {
+    private func emitFencedCodeBlock(_ block: Markdown.CodeBlock) {
         // Store the raw code content (not fenced here). Fencing handled in serializer.
         let lang = block.language?.isEmpty == false ? block.language : nil
         let info = CodeBlockMetadata(language: lang, content: block.code)
@@ -448,6 +451,13 @@ private enum InlineSerializer {
         if let lm = run[AttributeScopes.AMInlineAttributes.ListItemAttribute.self] {
             out.listMetadata = lm
         }
+#if canImport(SwiftUI)
+        if let swiftFont = run[AttributeScopes.SwiftUIAttributes.FontAttribute.self] {
+            let traits = SwiftUIFontTraits.resolve(swiftFont)
+            if !out.bold && traits.bold { out.bold = true }
+            if !out.italic && traits.italic { out.italic = true }
+        }
+#endif
         // Code overrides other styling semantics (code text not wrapped by emphasis markers).
         if out.code {
             out.bold = false
@@ -1069,6 +1079,29 @@ private enum InlineSerializer {
             return out
         }
     }
+
+#if canImport(SwiftUI)
+    private enum SwiftUIFontTraits {
+        static func resolve(_ font: SwiftUI.Font) -> (bold: Bool, italic: Bool) {
+            var bold = false
+            var italic = false
+            inspect(font, bold: &bold, italic: &italic, depth: 0)
+            return (bold, italic)
+        }
+
+        private static func inspect(_ value: Any, bold: inout Bool, italic: inout Bool, depth: Int) {
+            guard depth < 16 else { return }
+            let typeDescription = String(describing: type(of: value))
+            if typeDescription.contains("Bold") { bold = true }
+            if typeDescription.contains("Italic") { italic = true }
+
+            let mirror = Mirror(reflecting: value)
+            for child in mirror.children {
+                inspect(child.value, bold: &bold, italic: &italic, depth: depth + 1)
+            }
+        }
+    }
+#endif
 
     // MARK: - (Optional) Legacy Compatibility Shim
     // If you want the main toMarkdown() (from earlier version) to now use the AST approach,
