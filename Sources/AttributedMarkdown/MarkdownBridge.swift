@@ -1,6 +1,13 @@
 import Foundation
 import Markdown
 
+#if canImport(UIKit)
+    import UIKit
+#endif
+#if canImport(AppKit)
+    import AppKit
+#endif
+
 // MARK: - Shared Block Metadata Types (must appear before attribute declarations)
 
 /// Metadata for list items (applied per run that belongs to a single list item).
@@ -40,6 +47,7 @@ extension AttributeScopes {
         public let listItem: ListItemAttribute
         public let blockQuote: BlockQuoteAttribute
         public let codeBlock: CodeBlockAttribute
+        public let paragraph: ParagraphAttribute
 
         public struct BoldAttribute: AttributedStringKey {
             public static let name = "am.bold"
@@ -72,6 +80,10 @@ extension AttributeScopes {
         public struct CodeBlockAttribute: AttributedStringKey {
             public static let name = "am.codeblock"
             public typealias Value = CodeBlockMetadata
+        }
+        public struct ParagraphAttribute: AttributedStringKey {
+            public static let name = "am.paragraph"
+            public typealias Value = Int
         }
     }
 
@@ -153,10 +165,12 @@ private final class InlineAttributedStringRenderer {
         var listMetadata: ListMetadata? = nil
         var blockQuoteDepth: Int? = nil
         var codeBlockInfo: CodeBlockMetadata? = nil
+        var paragraphID: Int? = nil
     }
 
     private var stack: [StyleContext] = [StyleContext()]
     var output = AttributedString()
+    private var nextParagraphID: Int = 1
 
     // Entry traversal
     func visit(_ markup: Markup) {
@@ -218,18 +232,20 @@ private final class InlineAttributedStringRenderer {
             emitBlockQuote(quote, depth: (stack.last?.blockQuoteDepth ?? 0) + 1)
         case let blockCode as CodeBlock:
             emitFencedCodeBlock(blockCode)
+        case let para as Paragraph:
+            let paragraphID = nextParagraphID
+            nextParagraphID += 1
+            with {
+                $0.paragraphID = paragraphID
+            } body: {
+                for c in para.children { visit(c) }
+            }
         default:
             for child in markup.children { visit(child) }
         }
     }
 
     // MARK: - Block helpers (moved outside switch for correct scope)
-
-    private func appendNewlineIfNeeded() {
-        if output.characters.last != "\n" {
-            output.append(AttributedString("\n"))
-        }
-    }
 
     private func emitHeading(_ heading: Heading) {
         let level = max(1, min(heading.level, 6))
@@ -278,7 +294,7 @@ private final class InlineAttributedStringRenderer {
     private func emitBlockQuote(_ quote: BlockQuote, depth: Int) {
         // Apply depth metadata to every appended run inside the quote; no placeholder run.
         let childrenArray = Array(quote.children)
-        for (i, child) in childrenArray.enumerated() {
+        for child in childrenArray {
             with {
                 $0.blockQuoteDepth = depth
             } body: {
@@ -345,6 +361,9 @@ private final class InlineAttributedStringRenderer {
         if let cb = ctx.codeBlockInfo {
             run[AttributeScopes.AMInlineAttributes.CodeBlockAttribute.self] = cb
         }
+        if let paragraphID = ctx.paragraphID {
+            run[AttributeScopes.AMInlineAttributes.ParagraphAttribute.self] = paragraphID
+        }
 
         output.append(run)
     }
@@ -366,6 +385,7 @@ private enum InlineSerializer {
         var listMetadata: ListMetadata? = nil
         var blockQuoteDepth: Int? = nil
         var codeBlock: CodeBlockMetadata? = nil
+        var paragraphID: Int? = nil
 
         var styleOnlyKey: StyleKey {
             StyleKey(bold: bold, italic: italic, code: code, strike: strike, link: link != nil)
@@ -408,8 +428,19 @@ private enum InlineSerializer {
         if let cb = run[AttributeScopes.AMInlineAttributes.CodeBlockAttribute.self] {
             out.codeBlock = cb
         }
+        if let paragraphID = run[AttributeScopes.AMInlineAttributes.ParagraphAttribute.self] {
+            out.paragraphID = paragraphID
+        }
         if let link = run[AttributeScopes.FoundationAttributes.LinkAttribute.self] {
             out.link = link
+        }
+        // Fallback: Foundation InlinePresentationIntent (when editor sets semantic intents)
+        if let intent = run[
+            AttributeScopes.FoundationAttributes.InlinePresentationIntentAttribute.self]
+        {
+            if intent.contains(.stronglyEmphasized) { out.bold = true }
+            if intent.contains(.emphasized) { out.italic = true }
+            if intent.contains(.code) { out.code = true }
         }
         if let h = run[AttributeScopes.AMInlineAttributes.HeadingLevelAttribute.self] {
             out.headingLevel = h
@@ -439,17 +470,73 @@ private enum InlineSerializer {
         case blockQuote(depth: Int, lines: [[Segment]])
         case codeBlock(language: String?, content: String)
         case paragraph([Segment])
-        case blank
+        case blank(runLength: Int)  // exact count of consecutive newline characters
     }
 
     // Collect raw segments (no grouping yet)
     private static func collectSegments(from attributed: AttributedString) -> [Segment] {
         var result: [Segment] = []
+        // Bridge to NSAttributedString once to enable platform trait fallbacks (bold/italic/strike/link).
+        let ns = NSAttributedString(attributed)
+        var utf16Offset = 0
         for run in attributed.runs {
-            let flags = extract(run)
-            let text = String(attributed[run.range].characters)
-            guard !text.isEmpty else { continue }
+            var flags = extract(run)
+            let slice = attributed[run.range]
+            let text = String(slice.characters)
+            guard !text.isEmpty else {
+                // Still advance offset for consistency
+                utf16Offset += text.utf16.count
+                continue
+            }
+
+            // Fallbacks: derive styling from platform attributes when semantic attributes are absent.
+            let attrs = ns.attributes(at: utf16Offset, effectiveRange: nil)
+
+            #if canImport(UIKit)
+                if let font = attrs[.font] as? UIFont {
+                    let traits = font.fontDescriptor.symbolicTraits
+                    if !flags.bold && traits.contains(.traitBold) { flags.bold = true }
+                    if !flags.italic && traits.contains(.traitItalic) { flags.italic = true }
+                }
+            #elseif canImport(AppKit)
+                if let font = attrs[.font] as? NSFont {
+                    let traits = font.fontDescriptor.symbolicTraits
+                    if !flags.bold && traits.contains(.bold) { flags.bold = true }
+                    if !flags.italic && traits.contains(.italic) { flags.italic = true }
+                }
+            #endif
+
+            if !flags.strike {
+                if let num = attrs[.strikethroughStyle] as? NSNumber, num.intValue != 0 {
+                    flags.strike = true
+                } else {
+                    for keyName in [
+                        "NSStrikethrough",
+                        "NSStrikethroughStyle",
+                        "NSUnderlineStrikethroughStyle",
+                        "NSStrikethroughStyleAttributeName",
+                    ] {
+                        let k = NSAttributedString.Key(keyName)
+                        if let v = attrs[k] {
+                            if let n = v as? NSNumber, n.intValue != 0 {
+                                flags.strike = true
+                                break
+                            }
+                            if let i = v as? Int, i != 0 {
+                                flags.strike = true
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+
+            if flags.link == nil, let url = attrs[.link] as? URL {
+                flags.link = url
+            }
+
             result.append(Segment(text: text, flags: flags))
+            utf16Offset += text.utf16.count
         }
         return result
     }
@@ -459,8 +546,6 @@ private enum InlineSerializer {
         static func buildBlocks(from segments: [Segment]) -> [Block] {
             var blocks: [Block] = []
             var i = 0
-            var lastWasBlank = false
-
             while i < segments.count {
                 let seg = segments[i]
 
@@ -468,7 +553,6 @@ private enum InlineSerializer {
                 if let cb = seg.flags.codeBlock {
                     blocks.append(.codeBlock(language: cb.language, content: cb.content))
                     i += 1
-                    lastWasBlank = false
                     continue
                 }
 
@@ -481,7 +565,6 @@ private enum InlineSerializer {
                         j += 1
                     }
                     blocks.append(.heading(level: level, segments: headingSegs))
-                    lastWasBlank = false
                     i = j
                     continue
                 }
@@ -514,7 +597,6 @@ private enum InlineSerializer {
                     flushItem()
                     blocks.append(
                         isOrdered ? .orderedList(items: allItems) : .unorderedList(items: allItems))
-                    lastWasBlank = false
                     i = j
                     continue
                 }
@@ -551,48 +633,85 @@ private enum InlineSerializer {
                     flushLine()
                     if !lines.isEmpty {
                         blocks.append(.blockQuote(depth: depth, lines: lines))
-                        lastWasBlank = false
                         i = j
                         continue
                     }
                 }
 
-                // Newline handling (soft vs hard)
+                // Paragraph with explicit paragraph metadata (from inline renderer)
+                if let paragraphID = seg.flags.paragraphID {
+                    var collected: [Segment] = []
+                    var j = i
+                    while j < segments.count {
+                        let candidate = segments[j]
+                        guard candidate.flags.paragraphID == paragraphID else { break }
+                        collected.append(candidate)
+                        j += 1
+                    }
+                    if !collected.isEmpty {
+                        blocks.append(.paragraph(collected))
+                        i = j
+                        continue
+                    }
+                }
+
+                // Newline handling (preserve exact counts) with special casing for block quote internal separators.
                 if seg.text == "\n" || seg.text == "\r\n" {
-                    // Look ahead: double newline => hard paragraph break (.blank)
-                    let nextIsNewline =
-                        (i + 1 < segments.count)
-                        && (segments[i + 1].text == "\n" || segments[i + 1].text == "\r\n")
-                    if nextIsNewline {
-                        if !lastWasBlank {
-                            blocks.append(.blank)
-                            lastWasBlank = true
+                    var runLen = 0
+                    var j = i
+                    while j < segments.count {
+                        let t = segments[j].text
+                        if t == "\n" || t == "\r\n" {
+                            runLen += 1
+                            j += 1
+                        } else {
+                            break
                         }
-                        // Consume exactly one newline here; the next iteration will see the second
-                        // newline and skip adding another blank because lastWasBlank is true.
-                        i += 1
+                    }
+
+                    if runLen == 1 {
+                        // Determine context around this single newline.
+                        let prevIsQuote: Bool = {
+                            if let last = blocks.last, case .blockQuote = last { return true }
+                            return false
+                        }()
+                        let nextIsQuote: Bool = {
+                            if j < segments.count {
+                                return segments[j].flags.blockQuoteDepth != nil
+                            }
+                            return false
+                        }()
+
+                        if prevIsQuote || nextIsQuote {
+                            // Internal block quote line separator: consume without emitting a blank block.
+                            i += 1
+                            continue
+                        }
+
+                        // Could be a soft break in an existing paragraph when styles match.
+                        if case .paragraph(let prevSegs)? = blocks.last,
+                            let lastSeg = prevSegs.last,
+                            lastSeg.flags.styleOnlyKey == seg.flags.styleOnlyKey
+                        {
+                            var updated = prevSegs
+                            let tail = updated.removeLast()
+                            updated.append(Segment(text: tail.text + "\n", flags: tail.flags))
+                            blocks.removeLast()
+                            blocks.append(.paragraph(updated))
+                            i += 1
+                            continue
+                        }
+
+                        // Standalone blank line (structural break).
+                        blocks.append(.blank(runLength: 1))
+                        i = j
                         continue
                     } else {
-                        // Single newline = soft line break.
-                        // If the previous emitted block is a paragraph, merge this newline into its last segment;
-                        // otherwise, ignore it (prevents creating a standalone blank paragraph).
-                        if let last = blocks.last {
-                            switch last {
-                            case .paragraph(var prevSegs):
-                                if !prevSegs.isEmpty {
-                                    let lastSeg = prevSegs.removeLast()
-                                    let merged = Segment(
-                                        text: lastSeg.text + "\n", flags: lastSeg.flags)
-                                    prevSegs.append(merged)
-                                    blocks.removeLast()
-                                    blocks.append(.paragraph(prevSegs))
-                                }
-                            default:
-                                break
-                            }
-                        }
-                        i += 1
-                        lastWasBlank = false
+                        // Two or more consecutive newlines: exact blank run.
+                        // If the first newline would have been an internal quote separator we still
+                        // treat the whole run as blank vertical spacing (rare case).
+                        blocks.append(.blank(runLength: runLen))
+                        i = j
                         continue
                     }
                 }
@@ -621,15 +740,20 @@ private enum InlineSerializer {
                             // Hard break: stop paragraph; outer loop handles blank.
                             break
                         } else {
-                            // Soft break: merge into previous segment if any; if paragraph empty, ignore (avoid creating empty paragraph).
-                            if let last = para.popLast() {
-                                let merged = Segment(text: last.text + "\n", flags: last.flags)
-                                para.append(merged)
+                            // Soft break: merge into previous segment only when style flags match.
+                            if let last = para.last,
+                                last.flags.styleOnlyKey == s.flags.styleOnlyKey
+                            {
+                                let popped = para.removeLast()
+                                para.append(
+                                    Segment(text: popped.text + "\n", flags: popped.flags))
+                                j += 1
+                                continue
                             } else {
-                                // No prior content; ignore solitary leading soft newline.
+                                // Style mismatch indicates structural break; end paragraph here so the
+                                // newline can be handled by the outer loop (e.g. paragraph separator).
+                                break
                             }
-                            j += 1
-                            continue
                         }
                     }
 
@@ -677,7 +801,6 @@ private enum InlineSerializer {
                     // Do not emit a paragraph that is purely a single newline (already merged logic avoids this).
                     if !(para.count == 1 && (para[0].text == "\n" || para[0].text == "\r\n")) {
                         blocks.append(.paragraph(para))
-                        lastWasBlank = false
                     }
                     i = j
                     continue
@@ -685,24 +808,11 @@ private enum InlineSerializer {
 
                 // Fallback
                 blocks.append(.paragraph([seg]))
-                lastWasBlank = false
                 i += 1
             }
 
-            // Post-loop normalization
-            var normalized: [Block] = []
-            for (idx, b) in blocks.enumerated() {
-                if case .blank = b {
-                    if idx == 0 { continue }
-                    if let last = normalized.last, case .blank = last { continue }
-                    if let last = normalized.last, BlockRenderer.isStructural(last) { continue }
-                }
-                normalized.append(b)
-            }
-            if let last = normalized.last, case .blank = last {
-                normalized.removeLast()
-            }
-            return normalized
+            // Exact preservation mode: return collected blocks unmodified (quote internal newlines already filtered inline)
+            return blocks
         }
 
         // Rendering
@@ -749,12 +859,26 @@ private enum InlineSerializer {
                                 out.append("\n")
                             }
                         }
-                        out.append(renderParagraph(segs, isLast: isLast))
-                    case .blank:
-                        if !isLast { out.append("\n") }
+                        out.append(renderParagraph(segs))
+                        if !isLast {
+                            switch blocks[idx + 1] {
+                            case .blank:
+                                break
+                            default:
+                                if out.hasSuffix("\n") {
+                                    if !out.hasSuffix("\n\n") {
+                                        out.append("\n")
+                                    }
+                                } else {
+                                    out.append("\n\n")
+                                }
+                            }
+                        }
+                    case .blank(let runLength):
+                        out.append(String(repeating: "\n", count: runLength))
                     }
                 }
-                // Normalize only triple+ consecutive blanks; keep a final single blank line if produced by a structural block.
+                // Normalize only triple+ consecutive blanks to avoid runaway spacing.
                 while out.hasSuffix("\n\n\n") { out.removeLast() }
                 return out
             }
@@ -804,13 +928,10 @@ private enum InlineSerializer {
                 return rendered
             }
 
-            private static func renderParagraph(_ segs: [Segment], isLast: Bool) -> String {
+            private static func renderParagraph(_ segs: [Segment]) -> String {
                 guard !segs.isEmpty else { return "" }
-                var text = joinInline(segs)
-                if !isLast && !text.hasSuffix("\n") {
-                    text.append("\n")
-                }
-                return text
+                // Do not synthesize trailing newlines; exact newline runs are emitted by .blank(runLength:)
+                return joinInline(segs)
             }
 
             private static func renderHeadingBlock(level: Int, segs: [Segment]) -> String {
