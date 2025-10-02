@@ -32,15 +32,32 @@ public struct BasicMarkdownEncoder {
         }
 
         var open: [Wrapper] = []
+        var pendingPlain = String()
 
         for run in attributed.runs {
+            if !pendingPlain.isEmpty {
+                output.append(escapePlain(pendingPlain))
+                pendingPlain.removeAll(keepingCapacity: true)
+            }
+
             let fragment = AttributedString(attributed[run.range])
             guard !fragment.characters.isEmpty else { continue }
+
+            let raw = String(fragment.characters)
+            let (leadingSpaces, coreText, trailingSpaces) = splitTrimmableEdges(from: raw)
+
+            if coreText.isEmpty {
+                pendingPlain.append(raw)
+                continue
+            }
+
+            if !leadingSpaces.isEmpty {
+                output.append(escapePlain(leadingSpaces))
+            }
 
             let style = RunStyle(run: run)
             let desired = desiredWrappers(for: style)
 
-            // Diff currently open wrappers with the desired ones for this run.
             var commonPrefix = 0
             while commonPrefix < open.count,
                 commonPrefix < desired.count,
@@ -63,14 +80,18 @@ public struct BasicMarkdownEncoder {
                 }
             }
 
-            output.append(escapePlain(String(fragment.characters)))
+            output.append(escapePlain(coreText))
+            pendingPlain.append(trailingSpaces)
         }
 
-        // Close any wrappers that remained open at the end of the string.
         if !open.isEmpty {
             for wrapper in open.reversed() {
                 output.append(wrapper.rawValue)
             }
+        }
+
+        if !pendingPlain.isEmpty {
+            output.append(escapePlain(pendingPlain))
         }
 
         return output
@@ -129,4 +150,28 @@ private func escapePlain(_ text: String) -> String {
         }
     }
     return escaped
+}
+
+private func splitTrimmableEdges(from text: String) -> (leading: String, core: String, trailing: String) {
+    guard !text.isEmpty else { return ("", "", "") }
+
+    var start = text.startIndex
+    var end = text.endIndex
+
+    while start < end, isTrimmable(text[start]) {
+        start = text.index(after: start)
+    }
+
+    while end > start, isTrimmable(text[text.index(before: end)]) {
+        end = text.index(before: end)
+    }
+
+    let leading = String(text[..<start])
+    let core = String(text[start..<end])
+    let trailing = String(text[end...])
+    return (leading, core, trailing)
+}
+
+private func isTrimmable(_ character: Character) -> Bool {
+    character == " " || character == "\t"
 }

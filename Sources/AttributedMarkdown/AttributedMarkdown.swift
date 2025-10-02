@@ -75,8 +75,14 @@ private enum MarkdownSerializer {
         }
 
         var open: [Wrapper] = []
+        var pendingPlain = String()
 
         for run in attributed.runs {
+            if !pendingPlain.isEmpty {
+                result.append(escapePlain(pendingPlain))
+                pendingPlain.removeAll(keepingCapacity: true)
+            }
+
             let slice = attributed[run.range]
             var buffer = String()
             buffer.reserveCapacity(slice.characters.count)
@@ -90,16 +96,13 @@ private enum MarkdownSerializer {
                 utf16Location: utf16Offset
             )
 
-            // Handle code spans: close everything, emit code, reopen nothing (code is isolated).
             if inline.isCode {
-                // Close any open wrappers
                 if !open.isEmpty {
                     for w in open.reversed() { result.append(w.rawValue) }
                     open.removeAll()
                 }
                 let codeText = wrapCode(buffer)
                 if let link = inline.link {
-                    // Code inside link (rare) – wrap code span within link.
                     result.append("[\(codeText)](\(escapeLinkDestination(link)))")
                 } else {
                     result.append(codeText)
@@ -110,25 +113,34 @@ private enum MarkdownSerializer {
 
             let desired = desiredWrappers(for: inline)
 
-            // If this segment is a link AND there are currently open wrappers
-            // we close them first; links are treated as isolated for now.
+            let (leadingSpaces, coreText, trailingSpaces) = splitTrimmableEdges(from: buffer)
+
+            if coreText.isEmpty {
+                pendingPlain.append(buffer)
+                utf16Offset += buffer.utf16.count
+                continue
+            }
+
+            if !leadingSpaces.isEmpty {
+                result.append(escapePlain(leadingSpaces))
+            }
+
             if let link = inline.link {
                 if !open.isEmpty {
                     for w in open.reversed() { result.append(w.rawValue) }
                     open.removeAll()
                 }
-                // Apply wrappers strictly inside link text (spec-compliant):
-                var inner = escapePlain(buffer)
+                var inner = escapePlain(coreText)
                 for w in desired.reversed() {
                     let token = w.rawValue
                     inner = "\(token)\(inner)\(token)"
                 }
                 result.append("[\(inner)](\(escapeLinkDestination(link)))")
+                pendingPlain.append(trailingSpaces)
                 utf16Offset += buffer.utf16.count
                 continue
             }
 
-            // Diff wrappers: close those no longer needed.
             var i = 0
             while i < open.count && i < desired.count && open[i] == desired[i] {
                 i += 1
@@ -146,8 +158,20 @@ private enum MarkdownSerializer {
                 }
             }
 
-            // Emit escaped text inside currently open wrappers.
-            result.append(escapePlain(buffer))
+            result.append(escapePlain(coreText))
+            if trailingSpaces.contains("\n"), !open.isEmpty {
+                for ch in trailingSpaces {
+                    if ch == "\n" {
+                        for w in open.reversed() { result.append(w.rawValue) }
+                        open.removeAll()
+                        result.append("\n")
+                        continue
+                    }
+                    pendingPlain.append(ch)
+                }
+            } else {
+                pendingPlain.append(trailingSpaces)
+            }
             utf16Offset += buffer.utf16.count
         }
 
@@ -155,6 +179,10 @@ private enum MarkdownSerializer {
         if !open.isEmpty {
             for w in open.reversed() { result.append(w.rawValue) }
             open.removeAll()
+        }
+
+        if !pendingPlain.isEmpty {
+            result.append(escapePlain(pendingPlain))
         }
 
         return result
@@ -178,6 +206,30 @@ private enum MarkdownSerializer {
             }
         }
         return out
+    }
+
+    private static func splitTrimmableEdges(from text: String) -> (leading: String, core: String, trailing: String) {
+        guard !text.isEmpty else { return ("", "", "") }
+
+        var start = text.startIndex
+        var end = text.endIndex
+
+        while start < end, isTrimmable(text[start]) {
+            start = text.index(after: start)
+        }
+
+        while end > start, isTrimmable(text[text.index(before: end)]) {
+            end = text.index(before: end)
+        }
+
+        let leading = String(text[..<start])
+        let core = String(text[start..<end])
+        let trailing = String(text[end...])
+        return (leading, core, trailing)
+    }
+
+    private static func isTrimmable(_ character: Character) -> Bool {
+        character == " " || character == "\t"
     }
 
     // Choose code fence length based on longest backtick run.

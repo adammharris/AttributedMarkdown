@@ -1,6 +1,9 @@
 import AttributedMarkdown
 import Foundation
 import SwiftUI
+#if canImport(AppKit)
+import AppKit
+#endif
 
 /// Rich-text editor that keeps a "live" buffer (TextEditor-bound) and a canonical semantic
 /// representation for Markdown export. Inline formatting is derived from SwiftUI fonts while typing
@@ -88,6 +91,31 @@ struct DocumentEditorView: View {
             .focused($editorFocused)
             .padding(.horizontal, 4)
             .font(.body)
+            .contextMenu {
+                Button {
+                    toggleFontTrait(.bold)
+                } label: {
+                    Label("Bold", systemImage: "bold")
+                }
+
+                Button {
+                    toggleFontTrait(.italic)
+                } label: {
+                    Label("Italic", systemImage: "italic")
+                }
+
+                Button {
+                    toggleStrikethrough()
+                } label: {
+                    Label("Strikethrough", systemImage: "strikethrough")
+                }
+
+                Button {
+                    toggleInlineCode()
+                } label: {
+                    Label("Inline Code", systemImage: "chevron.left.slash.chevron.right")
+                }
+            }
     }
 
     private var toolbar: some View {
@@ -97,12 +125,28 @@ struct DocumentEditorView: View {
             } label: {
                 Label("Bold", systemImage: "bold")
             }
+            .keyboardShortcut("b", modifiers: [.command])
 
             Button {
                 toggleFontTrait(.italic)
             } label: {
                 Label("Italic", systemImage: "italic")
             }
+            .keyboardShortcut("i", modifiers: [.command])
+
+            Button {
+                toggleStrikethrough()
+            } label: {
+                Label("Strikethrough", systemImage: "strikethrough")
+            }
+            .keyboardShortcut("x", modifiers: [.command, .shift])
+
+            Button {
+                toggleInlineCode()
+            } label: {
+                Label("Inline Code", systemImage: "chevron.left.slash.chevron.right")
+            }
+            .keyboardShortcut("c", modifiers: [.command, .option])
 
             Spacer()
 
@@ -115,7 +159,11 @@ struct DocumentEditorView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
-        .background(Color(.secondarySystemBackground))
+        #if canImport(AppKit)
+            .background(Color(nsColor: NSColor.windowBackgroundColor))
+        #else
+            .background(Color(.secondarySystemBackground))
+        #endif
     }
 
     // MARK: Live Preview (Debounced)
@@ -148,6 +196,9 @@ struct DocumentEditorView: View {
 
     private func toggleFontTrait(_ kind: FontToggle) {
         editorBuffer.transformAttributes(in: &selection) { container in
+            guard container[AttributeScopes.AMInlineAttributes.CodeAttribute.self] != true else {
+                return
+            }
             let baseFont = container.font ?? .body
             let resolved = baseFont.resolve(in: fontResolutionContext)
             var wantsBold = resolved.isBold
@@ -168,6 +219,38 @@ struct DocumentEditorView: View {
                 newFont = newFont.italic()
             }
             container.font = newFont
+        }
+    }
+
+    private func toggleStrikethrough() {
+        editorBuffer.transformAttributes(in: &selection) { container in
+            guard container[AttributeScopes.AMInlineAttributes.CodeAttribute.self] != true else {
+                return
+            }
+            let isActive = container[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self]
+                == true || container.strikethroughStyle != nil
+            if isActive {
+                container[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self] = nil
+                container.strikethroughStyle = nil
+            } else {
+                container[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self] = true
+                container.strikethroughStyle = Text.LineStyle(pattern: .solid)
+            }
+        }
+    }
+
+    private func toggleInlineCode() {
+        editorBuffer.transformAttributes(in: &selection) { container in
+            let isActive = container[AttributeScopes.AMInlineAttributes.CodeAttribute.self] == true
+            if isActive {
+                container[AttributeScopes.AMInlineAttributes.CodeAttribute.self] = nil
+                container.font = .body
+            } else {
+                container[AttributeScopes.AMInlineAttributes.CodeAttribute.self] = true
+                container[AttributeScopes.AMInlineAttributes.StrikethroughAttribute.self] = nil
+                container.strikethroughStyle = nil
+                container.font = (container.font ?? .body).monospaced()
+            }
         }
     }
 
