@@ -444,6 +444,26 @@ private enum InlineSerializer {
             if intent.contains(.stronglyEmphasized) { out.bold = true }
             if intent.contains(.emphasized) { out.italic = true }
             if intent.contains(.code) { out.code = true }
+            if intent.contains(.strikethrough) { out.strike = true }
+        }
+        // Fallback for block-level semantics when only Foundation PresentationIntent is present
+        // (e.g., AttributedString(markdown:) pipeline). Map .header(level:) into headingLevel
+        // so exporter can emit proper # / ## / ... markers.
+        if out.headingLevel == nil {
+            if let presentation = run[
+                AttributeScopes.FoundationAttributes.PresentationIntentAttribute.self
+            ] {
+                for component in presentation.components {
+                    switch component.kind {
+                    case .header(let lvl):
+                        out.headingLevel = max(1, min(lvl, 6))
+                        // No need to continue scanning components once a header is found.
+                        break
+                    default:
+                        continue
+                    }
+                }
+            }
         }
         if let h = run[AttributeScopes.AMInlineAttributes.HeadingLevelAttribute.self] {
             out.headingLevel = h
@@ -838,17 +858,33 @@ private enum InlineSerializer {
 
             static func render(_ blocks: [Block]) -> String {
                 var out = String()
+                var lastWasHeading = false
                 for (idx, block) in blocks.enumerated() {
                     let isLast = idx == blocks.count - 1
                     switch block {
                     case .heading(let level, let segs):
                         out.append(renderHeadingBlock(level: level, segs: segs))
+                        // Ensure there is exactly one blank line after a heading.
+                        if !isLast {
+                            if case .blank = blocks[idx + 1] {
+                                // Defer to the .blank handler to emit exactly one additional newline.
+                                lastWasHeading = true
+                            } else {
+                                // No explicit blank block follows; add one more newline now (we already emitted one in renderHeadingBlock).
+                                out.append("\n")
+                                lastWasHeading = false
+                            }
+                        } else {
+                            lastWasHeading = false
+                        }
                     case .unorderedList(let items):
                         out.append(
                             renderListBlock(items: items, ordered: false, nextIsBlock: !isLast))
+                        lastWasHeading = false
                     case .orderedList(let items):
                         out.append(
                             renderListBlock(items: items, ordered: true, nextIsBlock: !isLast))
+                        lastWasHeading = false
                     case .blockQuote(let depth, let lines):
                         // Only add an extra blank line after a block quote if the next block is a different structural type.
                         let addBlankAfter: Bool = {
@@ -860,8 +896,10 @@ private enum InlineSerializer {
                         }()
                         out.append(
                             renderQuote(depth: depth, lines: lines, nextIsBlock: addBlankAfter))
+                        lastWasHeading = false
                     case .codeBlock(let lang, let content):
                         out.append(renderCodeBlock(lang: lang, content: content))
+                        lastWasHeading = false
                     case .paragraph(let segs):
                         // Safeguard: ensure a newline separates a preceding block quote from a following paragraph
                         if idx > 0 {
@@ -869,7 +907,20 @@ private enum InlineSerializer {
                                 out.append("\n")
                             }
                         }
-                        out.append(renderParagraph(segs))
+                        // If a heading precedes this paragraph, trim any leading newlines from the paragraph content
+                        // to avoid accumulating multiple blank lines beyond the single enforced separator.
+                        let segsToRender: [Segment] = {
+                            if idx > 0 {
+                                switch blocks[idx - 1] {
+                                case .heading:
+                                    return trimLeadingNewlines(from: segs)
+                                default:
+                                    break
+                                }
+                            }
+                            return segs
+                        }()
+                        out.append(renderParagraph(segsToRender))
                         if !isLast {
                             switch blocks[idx + 1] {
                             case .blank:
@@ -884,13 +935,47 @@ private enum InlineSerializer {
                                 }
                             }
                         }
+                        lastWasHeading = false
                     case .blank(let runLength):
-                        out.append(String(repeating: "\n", count: runLength))
+                        if lastWasHeading {
+                            // Heading already emitted one newline; cap additional blanking to exactly one more newline.
+                            out.append("\n")
+                            lastWasHeading = false
+                        } else {
+                            out.append(String(repeating: "\n", count: runLength))
+                        }
                     }
                 }
                 // Normalize only triple+ consecutive blanks to avoid runaway spacing.
                 while out.hasSuffix("\n\n\n") { out.removeLast() }
                 return out
+            }
+
+            /// Remove leading newline characters from a sequence of segments.
+            /// This is used to prevent over-spacing when content following a heading already
+            /// embeds extra newlines in its first segment.
+            private static func trimLeadingNewlines(from segs: [Segment]) -> [Segment] {
+                var result: [Segment] = []
+                result.reserveCapacity(segs.count)
+                var trimming = true
+                for s in segs {
+                    if trimming {
+                        var t = s.text
+                        // Strip leading \n characters
+                        while let first = t.first, first == "\n" { t.removeFirst() }
+                        if t.isEmpty {
+                            // Skip this segment entirely if it became empty and continue trimming
+                            continue
+                        } else {
+                            // Add the truncated first segment and stop trimming
+                            result.append(Segment(text: t, flags: s.flags))
+                            trimming = false
+                        }
+                    } else {
+                        result.append(s)
+                    }
+                }
+                return result
             }
 
             private static func joinInline(_ segs: [Segment]) -> String {
@@ -906,33 +991,73 @@ private enum InlineSerializer {
                     let keyBold = f.bold
                     let keyStrike = f.strike
                     let keyLink = f.link
-                    var group: [Segment] = []
+
+                    // Helper to build inner text for a non-code group without applying outer bold/strike/link wrappers
+                    func buildGroupInner(from start: Int, to end: Int) -> String {
+                        var s = String()
+                        var idx = start
+                        while idx < end {
+                            let esc = escapePlain(segs[idx].text)
+                            if segs[idx].flags.italic {
+                                s.append("*\(esc)*")
+                            } else {
+                                s.append(esc)
+                            }
+                            idx += 1
+                        }
+                        return s
+                    }
+
+                    // Collect first non-code group
+                    let groupStart = i
                     var j = i
                     while j < segs.count {
                         let nf = segs[j].flags
-                        if nf.code || nf.bold != keyBold || nf.strike != keyStrike
-                            || nf.link != keyLink
-                        {
+                        if nf.code || nf.bold != keyBold || nf.strike != keyStrike || nf.link != keyLink {
                             break
                         }
-                        group.append(segs[j])
                         j += 1
                     }
-                    var inner = String()
-                    for g in group {
-                        let esc = escapePlain(g.text)
-                        if g.flags.italic {
-                            inner.append("*\(esc)*")
-                        } else {
-                            inner.append(esc)
+
+                    // Look for pattern: [group1 (bold/strike/link)] + [code] + [group2 (same bold/strike/link)]
+                    if (keyBold || keyStrike || keyLink != nil), j < segs.count, segs[j].flags.code {
+                        let codeIndex = j
+                        let k = codeIndex + 1
+                        // Next group must match same bold/strike/link and be non-code
+                        let sameGroup: (Int) -> Bool = { idx in
+                            let nf = segs[idx].flags
+                            return !nf.code && nf.bold == keyBold && nf.strike == keyStrike && nf.link == keyLink
+                        }
+                        if k < segs.count, sameGroup(k) {
+                            // Collect second group
+                            let group2Start = k
+                            var group2End = group2Start
+                            while group2End < segs.count, sameGroup(group2End) { group2End += 1 }
+
+                            // Build combined inner: group1 + code + group2
+                            let inner1 = buildGroupInner(from: groupStart, to: j)
+                            let codeRendered = renderCodeSegment(segs[codeIndex].text, segs[codeIndex].flags)
+                            let inner2 = buildGroupInner(from: group2Start, to: group2End)
+                            var combined = inner1 + codeRendered + inner2
+                            // Apply outer wrappers once
+                            if keyBold { combined = "**\(combined)**" }
+                            if keyStrike { combined = "~~\(combined)~~" }
+                            if let link = keyLink {
+                                combined = "[\(combined)](\(escapeLinkDestination(link)))"
+                            }
+                            rendered.append(combined)
+                            i = group2End
+                            continue
                         }
                     }
-                    if keyBold { inner = "**\(inner)**" }
-                    if keyStrike { inner = "~~\(inner)~~" }
-                    if let link = keyLink {
-                        inner = "[\(inner)](\(escapeLinkDestination(link)))"
-                    }
-                    rendered.append(inner)
+
+                    // Default path: render this single group
+                    let inner = buildGroupInner(from: groupStart, to: j)
+                    var wrapped = inner
+                    if keyBold { wrapped = "**\(wrapped)**" }
+                    if keyStrike { wrapped = "~~\(wrapped)~~" }
+                    if let link = keyLink { wrapped = "[\(wrapped)](\(escapeLinkDestination(link)))" }
+                    rendered.append(wrapped)
                     i = j
                 }
                 return rendered
@@ -945,9 +1070,19 @@ private enum InlineSerializer {
             }
 
             private static func renderHeadingBlock(level: Int, segs: [Segment]) -> String {
-                let body = joinInline(segs).trimmingCharacters(in: .newlines)
+                // Heuristic normalization: headings are visually bold by nature; avoid emitting
+                // additional **strong** markers that may have been inferred from fonts.
+                // We keep italic/strike/link/code inside headings but suppress bold.
+                let noBoldSegs: [Segment] = segs.map { s in
+                    var f = s.flags
+                    f.bold = false
+                    return Segment(text: s.text, flags: f)
+                }
+                let body = joinInline(noBoldSegs).trimmingCharacters(in: .newlines)
                 let hashes = String(repeating: "#", count: max(1, min(level, 6)))
-                return "\(hashes) \(body)\n\n"
+                // End headings with a single newline; outer renderer will insert additional spacing
+                // as needed between blocks, avoiding multiple blank line explosions.
+                return "\(hashes) \(body)\n"
             }
 
             private static func renderListBlock(
